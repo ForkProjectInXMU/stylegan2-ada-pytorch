@@ -89,6 +89,7 @@ def conv2d_resample(x, w, f=None, up=1, down=1, padding=0, groups=1, flip_weight
     assert isinstance(groups, int) and (groups >= 1)
     out_channels, in_channels_per_group, kh, kw = _get_weight_shape(w)
     fw, fh = _get_filter_size(f)
+    # 4个方向上的padding
     px0, px1, py0, py1 = _parse_padding(padding)
 
     # Adjust padding to account for up/downsampling.

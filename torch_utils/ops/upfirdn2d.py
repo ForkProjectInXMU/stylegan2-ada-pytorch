@@ -117,6 +117,10 @@ def setup_filter(f, device=torch.device('cpu'), normalize=True, flip_filter=Fals
 
 #----------------------------------------------------------------------------
 
+# 它说这么写比标准pytorch写法更有效率，啊这，可读性不重要吗，算了，大概这就是大佬吧
+# gain果然是scale factor放缩因子，影响振幅
+# 坏了，这nm底层是编译cpp的玩意儿，woc了gg，难度爆表，看英文吧，别看代码了，总之他就是用cpp完成了下面这个操作。
+# 封装为了一个原子操作，这个箱子最好作为api直接用，造起来很难，改起来更难。
 def upfirdn2d(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1, impl='cuda'):
     r"""Pad, upsample, filter, and downsample a batch of 2D images.
 
@@ -159,6 +163,7 @@ def upfirdn2d(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1, impl='cu
     """
     assert isinstance(x, torch.Tensor)
     assert impl in ['ref', 'cuda']
+    # 如果用cuda走的是这里
     if impl == 'cuda' and x.device.type == 'cuda' and _init():
         return _upfirdn2d_cuda(up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain).apply(x, f)
     return _upfirdn2d_ref(x, f, up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain)
