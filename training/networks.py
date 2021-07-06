@@ -15,14 +15,20 @@ from torch_utils.ops import upfirdn2d
 from torch_utils.ops import bias_act
 from torch_utils.ops import fma
 
-#----------------------------------------------------------------------------
+# 这代码写得真漂亮，值得学习，很多地方写得很优美，很多地方简明干练，封装到位
+
+# ----------------------------------------------------------------------------
+
 
 @misc.profiled_function
 def normalize_2nd_moment(x, dim=1, eps=1e-8):
     return x * (x.square().mean(dim=dim, keepdim=True) + eps).rsqrt()
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 参数校验，完成style mixing、weight demodulation，用式1/2/3操作weight，变形了x，然后调用conv2d_resample
+# 然后把结果变形回来输出，其实主要就是weight操作+conv2d_resample这两步
 @misc.profiled_function
 def modulated_conv2d(
     x,                          # Input tensor of shape [batch_size, in_channels, in_height, in_width].
@@ -95,7 +101,8 @@ def modulated_conv2d(
         x = x.add_(noise)
     return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 @persistence.persistent_class
 class FullyConnectedLayer(torch.nn.Module):
@@ -108,6 +115,8 @@ class FullyConnectedLayer(torch.nn.Module):
         bias_init       = 0,        # Initial value for the additive bias.
     ):
         super().__init__()
+        # 存下参数，新建weight且除以lr_multiplier，新建bias，计算weight_gain(lr_mul/sqrt(in_features))
+        # bias_gain直接就等于lr_mul
         self.activation = activation
         self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) / lr_multiplier)
         self.bias = torch.nn.Parameter(torch.full([out_features], np.float32(bias_init))) if bias else None
@@ -115,23 +124,31 @@ class FullyConnectedLayer(torch.nn.Module):
         self.bias_gain = lr_multiplier
 
     def forward(self, x):
+        # scale the weight
         w = self.weight.to(x.dtype) * self.weight_gain
         b = self.bias
         if b is not None:
             b = b.to(x.dtype)
             if self.bias_gain != 1:
+                # scale the bias
                 b = b * self.bias_gain
 
         if self.activation == 'linear' and b is not None:
+            # 若不需要激活，则x=x*w+b
             x = torch.addmm(b.unsqueeze(0), x, w.t())
         else:
+            # 若需要激活，则先计算x与w的矩阵乘法
             x = x.matmul(w.t())
+            # 然后先add bias，再激活，再scale结果
             x = bias_act.bias_act(x, b, act=self.activation)
         return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# style无关
 # 自己封装的conv，一般的conv，没有mod、demod
+# 和modulated_conv2d的区别在于只有第二步conv2d_resample，没有weight mod/demod，也没有style_mixing
 @persistence.persistent_class
 class Conv2dLayer(torch.nn.Module):
     def __init__(self,
@@ -148,6 +165,7 @@ class Conv2dLayer(torch.nn.Module):
         trainable       = True,         # Update the weights of this layer during training?
     ):
         super().__init__()
+        # 存下参数，生成不更新的filter，计算weight_gain，计算act_gain
         self.activation = activation
         self.up = up
         self.down = down
@@ -157,6 +175,7 @@ class Conv2dLayer(torch.nn.Module):
         self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
         self.act_gain = bias_act.activation_funcs[activation].def_gain
 
+        # 设置内存存储方式，新建weight和bias，然后视情况登记为Param或buffer
         memory_format = torch.channels_last if channels_last else torch.contiguous_format
         weight = torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format)
         bias = torch.zeros([out_channels]) if bias else None
@@ -171,17 +190,20 @@ class Conv2dLayer(torch.nn.Module):
                 self.bias = None
 
     def forward(self, x, gain=1):
+        # scale weight，翻转weight，调用conv2d_resample
         w = self.weight * self.weight_gain
         b = self.bias.to(x.dtype) if self.bias is not None else None
         flip_weight = (self.up == 1) # slightly faster
         x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=self.down, padding=self.padding, flip_weight=flip_weight)
 
+        # 计算act_gain，然后再bias、act
         act_gain = self.act_gain * gain
         act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
         x = bias_act.bias_act(x, b, act=self.activation, gain=act_gain, clamp=act_clamp)
         return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 @persistence.persistent_class
 class MappingNetwork(torch.nn.Module):
@@ -198,6 +220,7 @@ class MappingNetwork(torch.nn.Module):
         w_avg_beta      = 0.995,    # Decay for tracking the moving average of W during training, None = do not track.
     ):
         super().__init__()
+        # 存下参数
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
@@ -205,22 +228,29 @@ class MappingNetwork(torch.nn.Module):
         self.num_layers = num_layers
         self.w_avg_beta = w_avg_beta
 
+        # 赋默认值，layer_feature为每层的输出channel，默认等于最终输出channels，embed与label有关，默认为0
         if embed_features is None:
             embed_features = w_dim
         if c_dim == 0:
             embed_features = 0
         if layer_features is None:
             layer_features = w_dim
+        # 默认为 [512, 512, 512, 512, 512, 512, 512, 512, 512]
+        # 也即 [in_channels, layer_channels * 7, out_channels]
         features_list = [z_dim + embed_features] + [layer_features] * (num_layers - 1) + [w_dim]
 
+        # 如果有输入label，就用一个全连接层处理一下得到embed_feature
         if c_dim > 0:
             self.embed = FullyConnectedLayer(c_dim, embed_features)
         for idx in range(num_layers):
+            # 构建每一层，输入输出channels从上述list找
             in_features = features_list[idx]
             out_features = features_list[idx + 1]
             layer = FullyConnectedLayer(in_features, out_features, activation=activation, lr_multiplier=lr_multiplier)
+            # fc0/fc1/.../fc7
             setattr(self, f'fc{idx}', layer)
 
+        # 初始化512维的w_avg，不要梯度
         if num_ws is not None and w_avg_beta is not None:
             self.register_buffer('w_avg', torch.zeros([w_dim]))
 
@@ -261,8 +291,12 @@ class MappingNetwork(torch.nn.Module):
                     x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
         return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# style相关
+# 校验参数，装配参数，调用调制卷积，然后再加bias加activation
+# 无论参数如何，每一个生成层都包含一次风格融合，区别是有没有上采样下采样啥的，不变的是风格融合卷积
 @persistence.persistent_class
 class SynthesisLayer(torch.nn.Module):
     def __init__(self,
@@ -333,8 +367,11 @@ class SynthesisLayer(torch.nn.Module):
         x = bias_act.bias_act(x, self.bias.to(x.dtype), act=self.activation, gain=act_gain, clamp=act_clamp)
         return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# style相关
+# 卷积核往往为1，内含一个卷积操作（包含公式1，不包含2、3）
 @persistence.persistent_class
 class ToRGBLayer(torch.nn.Module):
     def __init__(self, in_channels, out_channels, w_dim, kernel_size=1, conv_clamp=None, channels_last=False):
@@ -352,8 +389,10 @@ class ToRGBLayer(torch.nn.Module):
         x = bias_act.bias_act(x, self.bias.to(x.dtype), clamp=self.conv_clamp)
         return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 包含多个生成层
 @persistence.persistent_class
 class SynthesisBlock(torch.nn.Module):
     def __init__(self,
@@ -392,20 +431,24 @@ class SynthesisBlock(torch.nn.Module):
         if in_channels == 0:
             self.const = torch.nn.Parameter(torch.randn([out_channels, resolution, resolution]))
 
+        # 第一个后面的块包含一个生成层conv0，完成上采样
         if in_channels != 0:
             self.conv0 = SynthesisLayer(in_channels, out_channels, w_dim=w_dim, resolution=resolution, up=2,
                 resample_filter=resample_filter, conv_clamp=conv_clamp, channels_last=self.channels_last, **layer_kwargs)
             self.num_conv += 1
 
+        # 包含一个生成层conv1完成卷积
         self.conv1 = SynthesisLayer(out_channels, out_channels, w_dim=w_dim, resolution=resolution,
             conv_clamp=conv_clamp, channels_last=self.channels_last, **layer_kwargs)
         self.num_conv += 1
 
+        # 如果是最后一层(所有架构)或是skip架构(每一层)，搞一个torgb层
         if is_last or architecture == 'skip':
             self.torgb = ToRGBLayer(out_channels, img_channels, w_dim=w_dim,
                 conv_clamp=conv_clamp, channels_last=self.channels_last)
             self.num_torgb += 1
 
+        # 如果不是第一层，且是resnet架构，搞一个skip层
         if in_channels != 0 and architecture == 'resnet':
             self.skip = Conv2dLayer(in_channels, out_channels, kernel_size=1, bias=False, up=2,
                 resample_filter=resample_filter, channels_last=self.channels_last)
@@ -419,6 +462,7 @@ class SynthesisBlock(torch.nn.Module):
             with misc.suppress_tracer_warnings(): # this value will be treated as a constant
                 fused_modconv = (not self.training) and (dtype == torch.float32 or int(x.shape[0]) == 1)
 
+        # 数据预处理
         # Input.
         if self.in_channels == 0:
             x = self.const.to(dtype=dtype, memory_format=memory_format)
@@ -429,13 +473,16 @@ class SynthesisBlock(torch.nn.Module):
 
         # Main layers.
         if self.in_channels == 0:
+            # 第一层的话用conv1卷下就算了
             x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
         elif self.architecture == 'resnet':
+            # 后面的层如果是resnet的话用conv0上采样，再用conv1卷一下，然后再用x过skip层加上去
             y = self.skip(x, gain=np.sqrt(0.5))
             x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
             x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
             x = y.add_(x)
         else:
+            # 如果不是resnet的话，用conv0上采样一下，用conv1卷一下完事儿！
             x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
             x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
 
@@ -452,8 +499,10 @@ class SynthesisBlock(torch.nn.Module):
         assert img is None or img.dtype == torch.float32
         return x, img
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 包含多个生成块
 @persistence.persistent_class
 class SynthesisNetwork(torch.nn.Module):
     def __init__(self,
@@ -492,8 +541,11 @@ class SynthesisNetwork(torch.nn.Module):
             is_last = (res == self.img_resolution)
             block = SynthesisBlock(in_channels, out_channels, w_dim=w_dim, resolution=res,
                 img_channels=img_channels, is_last=is_last, use_fp16=use_fp16, **block_kwargs)
+            # num_conv记录了一个block内有多少个卷积，num_ws记录了一共需要多少个style，把各个block内的卷积数加起来即可
             self.num_ws += block.num_conv
+            # 最后一块要加上num_torgb，因为也用了style
             if is_last:
+                # 只有最后一块的torgb才加入计数，之前skip架构的torgb全都用别人的style，不拥有独立的
                 self.num_ws += block.num_torgb
             # f'b{4}'为b4, self.b(res) = block
             setattr(self, f'b{res}', block)
@@ -505,18 +557,25 @@ class SynthesisNetwork(torch.nn.Module):
             ws = ws.to(torch.float32)
             w_idx = 0
             for res in self.block_resolutions:
+                # 获取每一层的所有w
                 block = getattr(self, f'b{res}')
                 block_ws.append(ws.narrow(1, w_idx, block.num_conv + block.num_torgb))
                 w_idx += block.num_conv
 
+        # 一开始x和img都是空的，x在第一块中被初始化为4x4，开始有值
+        # 而img在skip架构中初始没值，在第一层中，x过torgb得到y加到img上，也即第一个y是初始值
+        # 后面每层中，img都先up到目标res，然后把x过torgb得到新的y加上去
+        # 而在非skip架构中，img始终没有值，直到最后一层x过了torgb才加到img上得到最终输出
         x = img = None
         for res, cur_ws in zip(self.block_resolutions, block_ws):
             block = getattr(self, f'b{res}')
             x, img = block(x, img, cur_ws, **block_kwargs)
         return img
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 包含上述俩网络
 @persistence.persistent_class
 class Generator(torch.nn.Module):
     def __init__(self,
@@ -545,7 +604,8 @@ class Generator(torch.nn.Module):
         img = self.synthesis(ws, **synthesis_kwargs)
         return img
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 @persistence.persistent_class
 class DiscriminatorBlock(torch.nn.Module):
@@ -629,7 +689,8 @@ class DiscriminatorBlock(torch.nn.Module):
         assert x.dtype == dtype
         return x, img
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 # 输入一个x矩阵，对其进行分组归一化，并将归一化结果y cat到x后面输出
 @persistence.persistent_class

@@ -18,11 +18,13 @@ from .. import custom_ops
 from .. import misc
 from . import conv2d_gradfix
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 _inited = False
 _plugin = None
 
+
+# 编译cpp
 def _init():
     global _inited, _plugin
     if not _inited:
@@ -34,6 +36,8 @@ def _init():
             warnings.warn('Failed to build CUDA kernels for upfirdn2d. Falling back to slow reference implementation. Details:\n\n' + traceback.format_exc())
     return _plugin is not None
 
+
+# scaling为int时变为2个一样的，如果本身就是2个的列表那么就返回这俩
 def _parse_scaling(scaling):
     if isinstance(scaling, int):
         scaling = [scaling, scaling]
@@ -43,6 +47,8 @@ def _parse_scaling(scaling):
     assert sx >= 1 and sy >= 1
     return sx, sy
 
+
+# 如果padding是1个，那么四周的padding都是这个数，如果是2个，那么2个水平的用1个，2个竖直的用1个，如果是4个，那么四周用这四个padding
 def _parse_padding(padding):
     if isinstance(padding, int):
         padding = [padding, padding]
@@ -54,6 +60,8 @@ def _parse_padding(padding):
     padx0, padx1, pady0, pady1 = padding
     return padx0, padx1, pady0, pady1
 
+
+# 如果f为空，那就是1x1.如果f.shape为[2]，则为2x2，如果f.shape为[2,3]，那么为3x2
 def _get_filter_size(f):
     if f is None:
         return 1, 1
@@ -63,12 +71,28 @@ def _get_filter_size(f):
     with misc.suppress_tracer_warnings():
         fw = int(fw)
         fh = int(fh)
+    # 原来可以这么写，牛，后面那个方括号的是选取的分片，f1维时只取第0维，f2维时取前2维
+    # [1,2,3,4][1,2] = [2]
     misc.assert_shape(f, [fh, fw][:f.ndim])
     assert fw >= 1 and fh >= 1
     return fw, fh
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+"""
+    sample:
+        input:
+            [1,3,3,1]
+        output:
+            [0.0156, 0.0469, 0.0469, 0.0156],
+            [0.0469, 0.1406, 0.1406, 0.0469],
+            [0.0469, 0.1406, 0.1406, 0.0469],
+            [0.0156, 0.0469, 0.0469, 0.0156]]
+"""
+
+
+# 生成filter，生成的filter具有对称性，满足一定的分布配比
 def setup_filter(f, device=torch.device('cpu'), normalize=True, flip_filter=False, gain=1, separable=None):
     r"""Convenience function to setup 2D FIR filter for `upfirdn2d()`.
 
@@ -115,12 +139,18 @@ def setup_filter(f, device=torch.device('cpu'), normalize=True, flip_filter=Fals
     f = f.to(device=device)
     return f
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 # 它说这么写比标准pytorch写法更有效率，啊这，可读性不重要吗，算了，大概这就是大佬吧
 # gain果然是scale factor放缩因子，影响振幅
 # 坏了，这nm底层是编译cpp的玩意儿，woc了gg，难度爆表，看英文吧，别看代码了，总之他就是用cpp完成了下面这个操作。
 # 封装为了一个原子操作，这个箱子最好作为api直接用，造起来很难，改起来更难。
+# 能做的事情：pad、up、filter、down
+# 1.用插0法完成up
+# 2.在四周加上padding
+# 3.用f卷积图像
+# 4.通过跳着取完成下采样
 def upfirdn2d(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1, impl='cuda'):
     r"""Pad, upsample, filter, and downsample a batch of 2D images.
 
@@ -133,6 +163,7 @@ def upfirdn2d(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1, impl='cu
 
     3. Convolve the image with the specified 2D FIR filter (`f`), shrinking it
        so that the footprint of all output pixels lies within the input image.
+       (将图像与指定的2D FIR滤波器(' f ')进行卷积，缩小图像，以使所有输出像素的足迹都位于输入图像中。
 
     4. Downsample the image by keeping every Nth pixel (`down`).
 
@@ -163,58 +194,77 @@ def upfirdn2d(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1, impl='cu
     """
     assert isinstance(x, torch.Tensor)
     assert impl in ['ref', 'cuda']
-    # 如果用cuda走的是这里
+    # cuda是用自己写的cpp完成，而ref则是使用标准pytorch实现的
+    # 追求速度用cuda，追求可读性用ref，两者应该只有速度上的差异
     if impl == 'cuda' and x.device.type == 'cuda' and _init():
         return _upfirdn2d_cuda(up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain).apply(x, f)
     return _upfirdn2d_ref(x, f, up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain)
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 使用标准的pytorch操作完成的参考实现，速度较慢，但是可读性较高
 @misc.profiled_function
 def _upfirdn2d_ref(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1):
     """Slow reference implementation of `upfirdn2d()` using standard PyTorch ops.
     """
     # Validate arguments.
     assert isinstance(x, torch.Tensor) and x.ndim == 4
+    # f为空时，f为[[1]]
     if f is None:
         f = torch.ones([1, 1], dtype=torch.float32, device=x.device)
+    # f不更新
     assert isinstance(f, torch.Tensor) and f.ndim in [1, 2]
     assert f.dtype == torch.float32 and not f.requires_grad
+
+    # 得到NCHW
     batch_size, num_channels, in_height, in_width = x.shape
+    # 分别得到水平和竖直方向上的放大倍数、缩小倍数，4周的padding数
     upx, upy = _parse_scaling(up)
     downx, downy = _parse_scaling(down)
     padx0, padx1, pady0, pady1 = _parse_padding(padding)
 
     # Upsample by inserting zeros.
+    # 用pad补0完成upsample，效果应该蛮一般
     x = x.reshape([batch_size, num_channels, in_height, 1, in_width, 1])
     x = torch.nn.functional.pad(x, [0, upx - 1, 0, 0, 0, upy - 1])
     x = x.reshape([batch_size, num_channels, in_height * upy, in_width * upx])
 
     # Pad or crop.
+    # 在四周padding，或裁剪（padding为负即完成裁剪）
     x = torch.nn.functional.pad(x, [max(padx0, 0), max(padx1, 0), max(pady0, 0), max(pady1, 0)])
     x = x[:, :, max(-pady0, 0) : x.shape[2] - max(-pady1, 0), max(-padx0, 0) : x.shape[3] - max(-padx1, 0)]
 
     # Setup filter.
+    # 用gain处理，scale一下filter
+    # 如果要翻转就翻转一下
     f = f * (gain ** (f.ndim / 2))
     f = f.to(x.dtype)
     if not flip_filter:
         f = f.flip(list(range(f.ndim)))
 
     # Convolve with the filter.
+    # 前半部分把f(4,4)变成了(1, 1, 4, 4), np.newaxis新增了俩维度在前面
+    # 后面repeat的参数为[C, 1, 1, 1], 对f的通道位置进行复制，其它位置不变，变成[C, 1, 4, 4]
     f = f[np.newaxis, np.newaxis].repeat([num_channels, 1] + [1] * f.ndim)
     if f.ndim == 4:
+        # 如果filter原先是2维的，直接卷积，用的是分组卷积
         x = conv2d_gradfix.conv2d(input=x, weight=f, groups=num_channels)
     else:
+        # 如果filter原先是1维的，先扩充第2维卷1次，再扩充第3维卷1次
         x = conv2d_gradfix.conv2d(input=x, weight=f.unsqueeze(2), groups=num_channels)
         x = conv2d_gradfix.conv2d(input=x, weight=f.unsqueeze(3), groups=num_channels)
 
     # Downsample by throwing away pixels.
+    # 跳着取完成下采样，这个估计也不太行
     x = x[:, :, ::downy, ::downx]
     return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 _upfirdn2d_cuda_cache = dict()
+
 
 def _upfirdn2d_cuda(up=1, down=1, padding=0, flip_filter=False, gain=1):
     """Fast CUDA implementation of `upfirdn2d()` using custom ops.
@@ -272,8 +322,10 @@ def _upfirdn2d_cuda(up=1, down=1, padding=0, flip_filter=False, gain=1):
     _upfirdn2d_cuda_cache[key] = Upfirdn2dCuda
     return Upfirdn2dCuda
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 封装好的，只使用功能2/3
 def filter2d(x, f, padding=0, flip_filter=False, gain=1, impl='cuda'):
     r"""Filter a batch of 2D images using the given 2D FIR filter.
 
@@ -308,8 +360,10 @@ def filter2d(x, f, padding=0, flip_filter=False, gain=1, impl='cuda'):
     ]
     return upfirdn2d(x, f, padding=p, flip_filter=flip_filter, gain=gain, impl=impl)
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 封装好的，只使用功能1/2/3
 def upsample2d(x, f, up=2, padding=0, flip_filter=False, gain=1, impl='cuda'):
     r"""Upsample a batch of 2D images using the given 2D FIR filter.
 
@@ -347,8 +401,10 @@ def upsample2d(x, f, up=2, padding=0, flip_filter=False, gain=1, impl='cuda'):
     ]
     return upfirdn2d(x, f, up=up, padding=p, flip_filter=flip_filter, gain=gain*upx*upy, impl=impl)
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 封装好的，只使用功能2/3/4
 def downsample2d(x, f, down=2, padding=0, flip_filter=False, gain=1, impl='cuda'):
     r"""Downsample a batch of 2D images using the given 2D FIR filter.
 
@@ -386,4 +442,4 @@ def downsample2d(x, f, down=2, padding=0, flip_filter=False, gain=1, impl='cuda'
     ]
     return upfirdn2d(x, f, down=down, padding=p, flip_filter=flip_filter, gain=gain, impl=impl)
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------

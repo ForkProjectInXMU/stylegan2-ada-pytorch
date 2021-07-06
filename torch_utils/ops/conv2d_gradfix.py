@@ -7,7 +7,9 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 """Custom replacement for `torch.nn.functional.conv2d` that supports
-arbitrarily high order gradients with zero performance penalty."""
+arbitrarily high order gradients with zero performance penalty.
+替换conv2d，支持任意高阶梯度，没有性能损失
+"""
 
 import warnings
 import contextlib

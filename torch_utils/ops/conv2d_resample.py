@@ -16,27 +16,35 @@ from . import upfirdn2d
 from .upfirdn2d import _parse_padding
 from .upfirdn2d import _get_filter_size
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 简单的字面意思，获取weight的shape
 def _get_weight_shape(w):
     with misc.suppress_tracer_warnings(): # this value will be treated as a constant
         shape = [int(sz) for sz in w.shape]
     misc.assert_shape(w, shape)
     return shape
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 def _conv2d_wrapper(x, w, stride=1, padding=0, groups=1, transpose=False, flip_weight=True):
     """Wrapper for the underlying `conv2d()` and `conv_transpose2d()` implementations.
+    底层卷积和反卷积的封装
     """
+    # get shape
     out_channels, in_channels_per_group, kh, kw = _get_weight_shape(w)
 
     # Flip weight if requested.
+    # flip
     if not flip_weight: # conv2d() actually performs correlation (flip_weight=True) not convolution (flip_weight=False).
         w = w.flip([2, 3])
 
     # Workaround performance pitfall in cuDNN 8.0.5, triggered when using
     # 1x1 kernel + memory_format=channels_last + less than 64 channels.
+    # 满足上述条件才会触发下面的代码，1x1，channel_last(第一维底层相邻), 少于64维
+    # 一般情况下不会触发下面的代码块
     if kw == 1 and kh == 1 and stride == 1 and padding in [0, [0, 0], (0, 0)] and not transpose:
         if x.stride()[1] == 1 and min(out_channels, in_channels_per_group) < 64:
             if out_channels <= 4 and groups == 1:
@@ -50,11 +58,20 @@ def _conv2d_wrapper(x, w, stride=1, padding=0, groups=1, transpose=False, flip_w
             return x.to(memory_format=torch.channels_last)
 
     # Otherwise => execute using conv2d_gradfix.
+    # 否则直接使用conv或transpose
     op = conv2d_gradfix.conv_transpose2d if transpose else conv2d_gradfix.conv2d
     return op(x, w, stride=stride, padding=padding, groups=groups)
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
+
+# 卷积+上下采样，具体的选项看fast path
+# w是给卷积用的，是会更新的，而f是给复合操作用的滤波器，只是滤波，不会被优化器更新
+# upfirdn2d就是up/down+滤波，不包含卷积的，做完然后再进行卷积
+# 而且更重要的是，upfirdn2d只用f不用w，不仅意味着不需要更新、没有梯度操作，还意味着它与style无关
+# style的引入完全与w有关，所以风格融合的过程完全在conv里而不在upfirdn2d里
+# 这也就意味着，我们只需要把这里的conv移进我们的网络即可移植styleGAN2的风格融合能力
+# style mixing能力完全在conv里，upfird只是up/down而已，把那一块切下来放进Unet应该就成了！
 @misc.profiled_function
 def conv2d_resample(x, w, f=None, up=1, down=1, padding=0, groups=1, flip_weight=True, flip_filter=False):
     r"""2D convolution with optional up/downsampling.
@@ -104,6 +121,8 @@ def conv2d_resample(x, w, f=None, up=1, down=1, padding=0, groups=1, flip_weight
         py0 += (fh - down + 1) // 2
         py1 += (fh - down) // 2
 
+    # 卷积核为1x1时使用补0，跳着取完成上采样下采样
+
     # Fast path: 1x1 convolution with downsampling only => downsample first, then convolve.
     if kw == 1 and kh == 1 and (down > 1 and up == 1):
         x = upfirdn2d.upfirdn2d(x=x, f=f, down=down, padding=[px0,px1,py0,py1], flip_filter=flip_filter)
@@ -121,6 +140,8 @@ def conv2d_resample(x, w, f=None, up=1, down=1, padding=0, groups=1, flip_weight
         x = upfirdn2d.upfirdn2d(x=x, f=f, padding=[px0,px1,py0,py1], flip_filter=flip_filter)
         x = _conv2d_wrapper(x=x, w=w, stride=down, groups=groups, flip_weight=flip_weight)
         return x
+
+    # 卷积核不为1x1时，使用跨步卷积完成下采样，使用反卷积完成上采样
 
     # Fast path: upsampling with optional downsampling => use transpose strided convolution.
     if up > 1:
@@ -142,11 +163,13 @@ def conv2d_resample(x, w, f=None, up=1, down=1, padding=0, groups=1, flip_weight
             x = upfirdn2d.upfirdn2d(x=x, f=f, down=down, flip_filter=flip_filter)
         return x
 
+    # 不做上下采样时，使用普通卷积
     # Fast path: no up/downsampling, padding supported by the underlying implementation => use plain conv2d.
     if up == 1 and down == 1:
         if px0 == px1 and py0 == py1 and px0 >= 0 and py0 >= 0:
             return _conv2d_wrapper(x=x, w=w, padding=[py0,px0], groups=groups, flip_weight=flip_weight)
 
+    # 应急计划：如果上面的都不满足，使用通用的参考实现，也即默认的先复合操作，再卷积，再下采样（如果有）
     # Fallback: Generic reference implementation.
     x = upfirdn2d.upfirdn2d(x=x, f=(f if up > 1 else None), up=up, padding=[px0,px1,py0,py1], gain=up**2, flip_filter=flip_filter)
     x = _conv2d_wrapper(x=x, w=w, groups=groups, flip_weight=flip_weight)
@@ -154,4 +177,4 @@ def conv2d_resample(x, w, f=None, up=1, down=1, padding=0, groups=1, flip_weight
         x = upfirdn2d.upfirdn2d(x=x, f=f, down=down, flip_filter=flip_filter)
     return x
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
